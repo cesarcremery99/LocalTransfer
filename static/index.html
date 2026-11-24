@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LocalTransfer</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#1b1d22; --muted:#666c78; --accent:#2f6fed; --ok:#1f9d55; --err:#d63c3c; --line:#e3e5ea; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111317; --card:#1b1e24; --text:#eceef2; --muted:#9aa1ad; --accent:#5b8ef7; --ok:#3ec27a; --err:#f06464; --line:#2b2f37; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:520px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 20px; font-size:.95rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:16px; }
+  label.pick { display:block; text-align:center; padding:28px 12px; border:2px dashed var(--line); border-radius:12px; cursor:pointer; font-weight:600; }
+  label.pick span { display:block; color:var(--muted); font-weight:400; font-size:.9rem; margin-top:6px; }
+  input[type=file] { display:none; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-top:12px; }
+  .grid img { width:100%; aspect-ratio:1; object-fit:cover; border-radius:6px; background:var(--line); }
+  .more { display:flex; align-items:center; justify-content:center; aspect-ratio:1; border-radius:6px; background:var(--line); color:var(--muted); font-weight:600; }
+  button { width:100%; padding:14px; font-size:1rem; font-weight:600; border:0; border-radius:12px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  .bar { height:10px; background:var(--line); border-radius:5px; overflow:hidden; margin:12px 0 6px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .15s; }
+  .status { font-size:.92rem; color:var(--muted); min-height:1.2em; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--err); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LocalTransfer</h1>
+  <p class="sub" id="sub">Send pictures to your PC over Wi-Fi.</p>
+
+  <div class="card" id="noToken" hidden>
+    <strong>Access code missing.</strong>
+    <p class="status">Open the full link (with <code>?t=…</code>) shown in the PC terminal, or scan its QR code.</p>
+  </div>
+
+  <div id="app">
+    <div class="card">
+      <label class="pick" for="files">Choose pictures
+        <span>More than 10 pictures are sent as one .zip file</span>
+      </label>
+      <input id="files" type="file" accept="image/*" multiple>
+      <div class="status" id="summary"></div>
+      <div class="grid" id="preview"></div>
+    </div>
+    <div class="card">
+      <button id="send" disabled>Send to PC</button>
+      <div class="bar"><div id="progress"></div></div>
+      <div class="status" id="status"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const ZIP_THRESHOLD = 10;             // more than this many files -> zip
+  const ZIP_MAX_BYTES = 0xFFFFFFFF - 50 * 1024 * 1024; // stay clear of the ZIP64 limit
+  const ZIP_MAX_ENTRIES = 65535;
+
+  const token = new URLSearchParams(location.search).get("t") || "";
+  const $ = (id) => document.getElementById(id);
+  const input = $("files"), sendBtn = $("send"), statusEl = $("status"), bar = $("progress");
+  let selected = [];
+
+  if (!token) { $("noToken").hidden = false; $("app").classList.add("hidden"); return; }
+
+  const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + " KB" : (b / 1048576).toFixed(1) + " MB";
+  const setStatus = (msg, cls = "") => { statusEl.textContent = msg; statusEl.className = "status " + cls; };
+  const setProgress = (frac) => { bar.style.width = Math.max(0, Math.min(1, frac)) * 100 + "%"; };
+
+  input.addEventListener("change", () => {
+    selected = Array.from(input.files || []);
+    const total = selected.reduce((s, f) => s + f.size, 0);
+    const mode = selected.length > ZIP_THRESHOLD ? " — will be sent as one .zip" : "";
+    $("summary").textContent = selected.length ? `${selected.length} picture(s), ${fmtSize(total)}${mode}` : "";
+    const grid = $("preview"); grid.innerHTML = "";
+    selected.slice(0, 11).forEach((f) => {
+      const img = document.createElement("img");
+      img.src = URL.createObjectURL(f); img.onload = () => URL.revokeObjectURL(img.src);
+      grid.appendChild(img);
+    });
+    if (selected.length > 11) {
+      const d = document.createElement("div"); d.className = "more";
+      d.textContent = "+" + (selected.length - 11); grid.appendChild(d);
+    }
+    sendBtn.disabled = selected.length === 0;
+    setStatus(""); setProgress(0);
+  });
+
+  // ---------- upload ----------
+  function upload(blob, name, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/upload?t=${encodeURIComponent(token)}&name=${encodeURIComponent(name)}`);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      xhr.onload = () => {
+        let body = {}; try { body = JSON.parse(xhr.responseText); } catch (_) {}
+        xhr.status === 200 ? resolve(body) : reject(new Error(body.error || `HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error("Network error — is the PC still running LocalTransfer?"));
+      xhr.send(blob);
+    });
+  }
+
+  // ---------- minimal ZIP writer (STORE, no compression — photos are already compressed) ----------
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(buf) {
+    const b = new Uint8Array(buf); let c = 0xFFFFFFFF;
+    for (let i = 0; i < b.length; i++) c = CRC_TABLE[(c ^ b[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function dosDateTime(ms) {
+    const d = new Date(ms || Date.now());
+    const year = Math.max(1980, d.getFullYear());
+    return {
+      time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+      date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+    };
+  }
+  function uniqueNames(files) {
+    const used = new Set();
+    return files.map((f, i) => {
+      let name = (f.name || `photo_${i + 1}.jpg`).replace(/[\\/]/g, "_");
+      if (used.has(name.toLowerCase())) {
+        const dot = name.lastIndexOf("."), stem = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : "";
+        let n = 1; while (used.has(`${stem}_${n}${ext}`.toLowerCase())) n++;
+        name = `${stem}_${n}${ext}`;
+      }
+      used.add(name.toLowerCase());
+      return name;
+    });
+  }
+
+  async function buildZip(files, onProgress) {
+    const enc = new TextEncoder();
+    const names = uniqueNames(files);
+    const parts = [], central = [];
+    let offset = 0;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i], nameBytes = enc.encode(names[i]);
+      const crc = crc32(await f.arrayBuffer()); // read one file at a time to keep memory low
+      const { time, date } = dosDateTime(f.lastModified);
+
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); // UTF-8 names
+      lh.setUint16(8, 0, true); lh.setUint16(10, time, true); lh.setUint16(12, date, true);
+      lh.setUint32(14, crc, true); lh.setUint32(18, f.size, true); lh.setUint32(22, f.size, true);
+      lh.setUint16(26, nameBytes.length, true); lh.setUint16(28, 0, true);
+      parts.push(lh.buffer, nameBytes, f); // the File itself is referenced, not copied
+
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+      ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true); ch.setUint16(12, time, true); ch.setUint16(14, date, true);
+      ch.setUint32(16, crc, true); ch.setUint32(20, f.size, true); ch.setUint32(24, f.size, true);
+      ch.setUint16(28, nameBytes.length, true); ch.setUint32(42, offset, true);
+      central.push(ch.buffer, nameBytes);
+
+      offset += 30 + nameBytes.length + f.size;
+      onProgress((i + 1) / files.length);
+    }
+    const cdSize = central.reduce((s, p) => s + p.byteLength, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+    end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+  }
+
+  function stamp() {
+    const d = new Date(), p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  sendBtn.addEventListener("click", async () => {
+    const files = selected.slice();
+    if (!files.length) return;
+    sendBtn.disabled = true; input.disabled = true; setProgress(0);
+    const total = files.reduce((s, f) => s + f.size, 0);
+    const zipIt = files.length > ZIP_THRESHOLD && total < ZIP_MAX_BYTES && files.length <= ZIP_MAX_ENTRIES;
+    try {
+      if (zipIt) {
+        setStatus(`Packing ${files.length} pictures into a zip…`);
+        const zip = await buildZip(files, (f) => setProgress(f * 0.15));
+        const name = `photos_${stamp()}_${files.length}.zip`;
+        setStatus(`Uploading ${name} (${fmtSize(zip.size)})…`);
+        const res = await upload(zip, name, (f) => setProgress(0.15 + f * 0.85));
+        setProgress(1);
+        setStatus(`Done! Saved ${res.saved} with ${files.length} pictures.`, "ok");
+      } else {
+        let sent = 0;
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          setStatus(`Uploading ${i + 1} of ${files.length}: ${f.name}`);
+          await upload(f, f.name || `photo_${i + 1}.jpg`, (p) => setProgress((sent + p * f.size) / total));
+          sent += f.size;
+        }
+        setProgress(1);
+        setStatus(`Done! Sent ${files.length} picture(s).`, "ok");
+      }
+      input.value = ""; selected = [];
+      $("summary").textContent = ""; $("preview").innerHTML = "";
+    } catch (e) {
+      setStatus("Failed: " + e.message, "err");
+      sendBtn.disabled = false;
+    } finally {
+      input.disabled = false;
+    }
+  });
+
+  // Verify the access code up front so a bad link fails early.
+  fetch(`/ping?t=${encodeURIComponent(token)}`).then((r) => {
+    if (!r.ok) setStatus("This link's access code is wrong or expired — use the link from the PC terminal.", "err");
+  }).catch(() => {});
+})();
+</script>
+</body>
+</html>
