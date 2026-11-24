@@ -181,15 +181,39 @@ def print_qr(url: str) -> None:
     qr.print_ascii(invert=True)
 
 
+_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+
+
+def choose_code(given: str | None) -> str:
+    """Return the access code: from --code, typed at a prompt, or random."""
+    if given is not None:
+        if not _CODE_RE.fullmatch(given):
+            sys.exit("Access code must be 4-64 characters: letters, digits, '-' or '_'.")
+        return given
+    if not sys.stdin.isatty():
+        return secrets.token_urlsafe(6)
+    while True:
+        try:
+            typed = input("Access code for the link (press Enter for a random one): ").strip()
+        except EOFError:
+            typed = ""
+        if not typed:
+            return secrets.token_urlsafe(6)
+        if _CODE_RE.fullmatch(typed):
+            return typed
+        print("  Use 4-64 characters: letters, digits, '-' or '_'. Try again.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Receive pictures from your phone over the local network.")
     parser.add_argument("-p", "--port", type=int, default=8765, help="port to listen on (default 8765)")
     parser.add_argument("-o", "--output", type=Path, default=default_output_dir(),
                         help="folder to save pictures in (default ~/Pictures/LocalTransfer)")
-    parser.add_argument("--code", help="fixed access code (default: random each run)")
+    parser.add_argument("--code", help="access code used in the link; skips the prompt "
+                        "(default: asked at startup, random if left empty)")
     args = parser.parse_args()
 
-    TransferHandler.token = args.code or secrets.token_urlsafe(6)
+    TransferHandler.token = choose_code(args.code)
     TransferHandler.output_dir = args.output.expanduser().resolve()
     TransferHandler.output_dir.mkdir(parents=True, exist_ok=True)
 
