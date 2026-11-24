@@ -3,8 +3,9 @@
 over your local network.
 
 Run this script on the PC, then open the printed URL (or scan the QR code)
-on your phone. Pick pictures and tap "Send". Batches of more than 10 pictures
-are packed into a single .zip on the phone before uploading.
+on your phone. Pick pictures and tap "Send". Pictures are saved into a folder
+per day. Photos that already reached the PC are skipped when re-sent, so a large
+transfer can be resumed or split into several smaller selections.
 
 Only the Python standard library is required. If the optional `qrcode`
 package is installed (pip install qrcode) a QR code is printed in the terminal.
@@ -20,6 +21,7 @@ import re
 import secrets
 import socket
 import sys
+import threading
 import unicodedata
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -83,11 +85,47 @@ def unique_path(directory: Path, name: str) -> Path:
     return candidate
 
 
+class Manifest:
+    """Remembers which photos already reached this PC (keyed by the phone's
+    file name + size), so re-sending a selection skips them. Stored as an
+    append-only text file in the output folder, so it survives restarts."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self.keys: set[str] = set()
+        if path.exists():
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    key = line.rstrip("\n").split("\t", 1)[0]
+                    if key:
+                        self.keys.add(key)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.keys
+
+    def add(self, key: str, saved_as: str) -> None:
+        with self.lock:
+            if key in self.keys:
+                return
+            self.keys.add(key)
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(f"{key}\t{saved_as}\n")
+
+
+def clean_key(raw: str) -> str:
+    return re.sub(r"[\t\r\n]", " ", raw)[:300]
+
+
 class TransferHandler(BaseHTTPRequestHandler):
-    server_version = "LocalTransfer/1.0"
+    server_version = "LocalTransfer/2.0"
+    protocol_version = "HTTP/1.1"  # keep-alive: reuse connections across thousands of uploads
     # Set on the class by main()
     token: str = ""
     output_dir: Path = default_output_dir()
+    manifest: Manifest
+    name_lock = threading.Lock()
+    saved_count = 0
 
     # ---- helpers -------------------------------------------------------
     def _send(self, status: int, body: bytes, ctype: str) -> None:
@@ -101,11 +139,30 @@ class TransferHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: dict) -> None:
         self._send(status, json.dumps(payload).encode(), "application/json")
 
+    def _reject(self, status: int, msg: str) -> None:
+        # The request body was not read, so this connection can't be reused.
+        self.close_connection = True
+        self._json(status, {"error": msg})
+
     def _authorized(self, query: dict) -> bool:
         given = (query.get("t") or [""])[0] or self.headers.get("X-Token", "")
         return secrets.compare_digest(given, self.token)
 
-    def log_message(self, fmt: str, *args) -> None:  # quieter logging
+    def _length(self, limit: int) -> int | None:
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._reject(HTTPStatus.LENGTH_REQUIRED, "Content-Length required")
+            return None
+        if length < 0 or length > limit:
+            self._reject(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "bad size")
+            return None
+        return length
+
+    def log_request(self, code="-", size="-") -> None:
+        pass  # don't print a line for each of thousands of requests
+
+    def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write(f"  [{self.address_string()}] {fmt % args}\n")
 
     # ---- routes --------------------------------------------------------
@@ -121,28 +178,39 @@ class TransferHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         url = urlparse(self.path)
-        if url.path != "/upload":
-            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-            return
         query = parse_qs(url.query)
-        if not self._authorized(query):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "invalid or missing access code"})
-            return
+        if url.path not in ("/upload", "/check"):
+            self._reject(HTTPStatus.NOT_FOUND, "not found")
+        elif not self._authorized(query):
+            self._reject(HTTPStatus.FORBIDDEN, "invalid or missing access code")
+        elif url.path == "/check":
+            self._check()
+        else:
+            self._upload(query)
 
+    def _check(self) -> None:
+        """Body: {"keys": [...]} -> {"have": [keys already on the PC]}"""
+        length = self._length(32 * 1024 * 1024)
+        if length is None:
+            return
         try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            self._json(HTTPStatus.LENGTH_REQUIRED, {"error": "Content-Length required"})
+            keys = json.loads(self.rfile.read(length) or b"{}").get("keys", [])
+        except (ValueError, AttributeError):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "bad JSON"})
             return
-        if length <= 0 or length > MAX_UPLOAD_BYTES:
-            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "bad size"})
-            return
+        have = [k for k in keys if isinstance(k, str) and clean_key(k) in self.manifest]
+        self._json(HTTPStatus.OK, {"have": have})
 
-        name = safe_filename((query.get("name") or ["upload"])[0], "upload")
+    def _upload(self, query: dict) -> None:
+        length = self._length(MAX_UPLOAD_BYTES)
+        if length is None:
+            return
+        raw_name = (query.get("name") or ["upload"])[0]
+        name = safe_filename(raw_name, "upload")
+        key = clean_key((query.get("key") or [f"{raw_name}|{length}"])[0])
         target_dir = self.output_dir / _dt.date.today().isoformat()
         target_dir.mkdir(parents=True, exist_ok=True)
-        final = unique_path(target_dir, name)
-        partial = final.with_name(final.name + ".part")
+        partial = target_dir / f".{secrets.token_hex(8)}.part"
 
         remaining = length
         try:
@@ -150,22 +218,32 @@ class TransferHandler(BaseHTTPRequestHandler):
                 while remaining > 0:
                     chunk = self.rfile.read(min(CHUNK, remaining))
                     if not chunk:
-                        raise ConnectionError("client disconnected")
+                        raise ConnectionError("phone disconnected mid-upload")
                     fh.write(chunk)
                     remaining -= len(chunk)
-            # Re-check uniqueness in case of a concurrent upload with the same name.
-            final = unique_path(target_dir, final.name)
-            partial.rename(final)
+            try:  # keep the photo's original date if the phone sent one
+                mtime = float((query.get("lm") or [""])[0]) / 1000
+                if mtime > 0:
+                    os.utime(partial, (mtime, mtime))
+            except ValueError:
+                pass
+            with self.name_lock:  # pick a free name and claim it atomically
+                final = unique_path(target_dir, name)
+                partial.rename(final)
+                TransferHandler.saved_count += 1
+                count = TransferHandler.saved_count
         except Exception as exc:  # noqa: BLE001
             partial.unlink(missing_ok=True)
-            self.log_message("upload failed: %s", exc)
+            self.close_connection = True
+            self.log_message("upload of %s failed: %s", name, exc)
             try:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             except OSError:
                 pass
             return
 
-        print(f"  Saved {final}  ({length / 1024 / 1024:.1f} MB)")
+        self.manifest.add(key, f"{target_dir.name}/{final.name}")
+        print(f"  #{count:<6} {final.name}  ({length / 1024 / 1024:.1f} MB)")
         self._json(HTTPStatus.OK, {"ok": True, "saved": final.name, "bytes": length})
 
 
@@ -216,12 +294,17 @@ def main() -> None:
     TransferHandler.token = choose_code(args.code)
     TransferHandler.output_dir = args.output.expanduser().resolve()
     TransferHandler.output_dir.mkdir(parents=True, exist_ok=True)
+    TransferHandler.manifest = Manifest(TransferHandler.output_dir / ".localtransfer-received.txt")
+    for stale in TransferHandler.output_dir.glob("*/.*.part"):  # leftovers from an interrupted run
+        stale.unlink(missing_ok=True)
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), TransferHandler)
     urls = [f"http://{ip}:{args.port}/?t={TransferHandler.token}" for ip in lan_addresses()]
 
     print("\nLocalTransfer is running.")
     print(f"  Saving to: {TransferHandler.output_dir}")
+    if TransferHandler.manifest.keys:
+        print(f"  Already received earlier: {len(TransferHandler.manifest.keys)} pictures (these are skipped)")
     print("  Open this on your phone (same Wi-Fi network):")
     for u in urls:
         print(f"    {u}")
