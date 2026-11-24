@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -93,24 +94,29 @@ class Manifest:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.lock = threading.Lock()
-        self.keys: set[str] = set()
+        self.keys: dict[str, str] = {}
         if path.exists():
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    key = line.rstrip("\n").split("\t", 1)[0]
+                    key, _, saved_as = line.rstrip("\n").partition("\t")
                     if key:
-                        self.keys.add(key)
+                        self.keys[key] = saved_as
 
     def __contains__(self, key: str) -> bool:
         return key in self.keys
 
-    def add(self, key: str, saved_as: str) -> None:
+    def get(self, key: str) -> str | None:
+        return self.keys.get(key)
+
+    def add(self, saved_as: str, *keys: str) -> None:
         with self.lock:
-            if key in self.keys:
+            new = [k for k in keys if k and k not in self.keys]
+            if not new:
                 return
-            self.keys.add(key)
             with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(f"{key}\t{saved_as}\n")
+                for key in new:
+                    self.keys[key] = saved_as
+                    fh.write(f"{key}\t{saved_as}\n")
 
 
 KNOWN_EXTS = {".jpg", ".jpeg", ".heic", ".heif", ".png", ".gif", ".webp", ".dng", ".tif", ".tiff",
@@ -139,6 +145,34 @@ def sniff_extension(path: Path) -> str:
             return ".mov"
         return ".mp4"
     return ""
+
+
+class HashingWriter:
+    """File wrapper that computes a SHA-256 of everything written."""
+
+    def __init__(self, fh) -> None:
+        self.fh, self.sha = fh, hashlib.sha256()
+
+    def write(self, data: bytes) -> None:
+        self.sha.update(data)
+        self.fh.write(data)
+
+
+_EXIF_DATE = re.compile(rb"((?:19|20)\d\d):([01]\d):([0-3]\d) ([0-2]\d):([0-5]\d):([0-5]\d)")
+
+
+def photo_date(path: Path) -> _dt.datetime | None:
+    """Find the date a photo was taken from its EXIF data (JPEG and HEIC).
+    A simple scan of the file's start is enough: the EXIF block sits there."""
+    with open(path, "rb") as fh:
+        head = fh.read(512 * 1024)
+    m = _EXIF_DATE.search(head)
+    if not m:
+        return None
+    try:
+        return _dt.datetime(*(int(g) for g in m.groups()))
+    except ValueError:
+        return None
 
 
 def parse_taken(raw: str) -> float | None:
@@ -202,11 +236,19 @@ class TransferHandler(BaseHTTPRequestHandler):
     def _shortcut_key(self, query: dict) -> str | None:
         """Key for uploads from the iPhone Shortcut: photo name + date taken,
         sent as X-Name / X-Taken headers (or name / taken query parameters)."""
-        name = self.headers.get("X-Name") or (query.get("name") or [""])[0]
         taken = self.headers.get("X-Taken") or (query.get("taken") or [""])[0]
-        if not name:
+        name = self.headers.get("X-Name") or ((query.get("name") or [""])[0] if taken else "")
+        if not name:  # not a Shortcut-style request (the browser page uses name|size keys)
             return None
         return clean_key(f"shortcut|{name.strip()}|{taken.strip()}")
+
+    @staticmethod
+    def _client_key(query: dict, raw_name: str, length: int) -> str:
+        """Key the browser page uses to skip photos (name|size)."""
+        given = (query.get("key") or [""])[0]
+        if given:
+            return clean_key(given)
+        return clean_key(f"{raw_name}|{length}") if raw_name else ""
 
     def _read_body(self, fh) -> int:
         """Copy the request body into fh; supports Content-Length and chunked uploads."""
@@ -296,7 +338,7 @@ class TransferHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"have": have})
 
     def _upload(self, query: dict) -> None:
-        raw_name = self.headers.get("X-Name") or (query.get("name") or ["upload"])[0]
+        raw_name = self.headers.get("X-Name") or (query.get("name") or [""])[0]
         name = safe_filename(raw_name, "upload")
         target_dir = self.output_dir / _dt.date.today().isoformat()
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -304,9 +346,23 @@ class TransferHandler(BaseHTTPRequestHandler):
 
         try:
             with open(partial, "wb") as fh:
-                length = self._read_body(fh)
+                writer = HashingWriter(fh)
+                length = self._read_body(writer)
             if length == 0:
                 raise ValueError("empty upload")
+            # Same photo already on the PC (whichever way it was sent)? Don't keep a copy.
+            content_key = "sha256:" + writer.sha.hexdigest()
+            existing = self.manifest.get(content_key)
+            if existing:
+                partial.unlink(missing_ok=True)
+                key = self._shortcut_key(query) or self._client_key(query, raw_name, length)
+                self.manifest.add(existing, key)
+                self._json(HTTPStatus.OK, {"ok": True, "duplicate": True, "saved": existing, "bytes": length})
+                return
+            taken = photo_date(partial)
+            if not raw_name:  # e.g. the iPhone Shortcut: name it after the date taken
+                stamp = (taken or _dt.datetime.now()).strftime("%Y%m%d_%H%M%S")
+                name = f"IMG_{stamp}"
             # Keep the photo's original date if the phone sent one.
             mtime = None
             try:
@@ -315,6 +371,8 @@ class TransferHandler(BaseHTTPRequestHandler):
                 pass
             if not mtime or mtime <= 0:
                 mtime = parse_taken(self.headers.get("X-Taken") or (query.get("taken") or [""])[0])
+            if (not mtime or mtime <= 0) and taken:
+                mtime = taken.timestamp()
             if mtime and mtime > 0:
                 os.utime(partial, (mtime, mtime))
             # Shortcuts may send names without an extension ("IMG_1234").
@@ -341,8 +399,8 @@ class TransferHandler(BaseHTTPRequestHandler):
                 pass
             return
 
-        key = self._shortcut_key(query) or clean_key((query.get("key") or [f"{raw_name}|{length}"])[0])
-        self.manifest.add(key, f"{target_dir.name}/{final.name}")
+        key = self._shortcut_key(query) or self._client_key(query, raw_name, length)
+        self.manifest.add(f"{target_dir.name}/{final.name}", key, content_key)
         print(f"  #{count:<6} {final.name}  ({length / 1024 / 1024:.1f} MB)")
         self._json(HTTPStatus.OK, {"ok": True, "saved": final.name, "bytes": length})
 
@@ -403,8 +461,9 @@ def main() -> None:
 
     print("\nLocalTransfer is running.")
     print(f"  Saving to: {TransferHandler.output_dir}")
-    if TransferHandler.manifest.keys:
-        print(f"  Already received earlier: {len(TransferHandler.manifest.keys)} pictures (these are skipped)")
+    received = len(set(TransferHandler.manifest.keys.values()))
+    if received:
+        print(f"  Already received earlier: {received} pictures (these are skipped)")
     print("  Open this on your phone (same Wi-Fi network):")
     for u in urls:
         print(f"    {u}")

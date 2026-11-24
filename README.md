@@ -63,25 +63,28 @@ Built for large transfers (thousands of pictures):
 
 ## iPhone Shortcut: send all photos without selecting
 
-The Shortcuts app can find photos by itself, for example all photos or only those from the
-last month, and send each one the PC doesn't have yet. On the phone page, open
-**"iPhone: send ALL photos without selecting (Shortcut)"**. It lists the steps with your
-PC's address and access code filled in, plus Copy buttons. In short:
+The iPhone app **Shortcuts** (Dutch: **Opdrachten**) can find all photos by itself and send
+them, so you don't have to select anything. On the phone page, open **"iPhone: send ALL
+photos without selecting them"**. It shows the steps with your PC's link filled in and a
+Copy button. The shortcut has only three actions:
 
-1. **Find Photos** (Media Type is Image; optionally a Creation Date filter)
-2. **Repeat with Each**, and inside it:
-   1. **Get Details of Images** → Name, then again → Date Taken
-   2. **Format Date** with the custom format `yyyyMMdd-HHmmss`
-   3. **Get Contents of URL** `http://<PC>:8765/has?t=<code>` with the headers
-      `X-Name` = Name and `X-Taken` = Formatted Date. The PC answers `yes` or `no`.
-   4. **If** the result is `no`: **Get Contents of URL** `http://<PC>:8765/upload?t=<code>`,
-      method POST, the same headers, Request Body **File** = Repeat Item.
+1. **Find Photos** (NL: *Zoek foto's*)
+2. **Repeat with Each** (NL: *Herhaal met elk*)
+3. Inside the repeat: **Get Contents of URL** (NL: *Haal inhoud van URL op*) with the URL
+   `http://<PC>:8765/upload?t=<code>`, method **POST**, request body **File** (NL: *Bestand*)
+   = **Repeat Item** (NL: *Herhaalobject*).
 
-Because the PC remembers what it has, you can run the shortcut again whenever you want
-and it only sends new photos. Use a fixed access code (`--code`) so the URLs stay valid.
-Photos arrive in their original format (usually HEIC). Add a **Convert Image** (JPEG) step
-if you want JPEG. Photos sent by the shortcut and photos sent from the browser page are
-tracked separately, so use one method for a given set of photos to avoid duplicates.
+The PC handles the rest:
+
+- It names each photo after the date it was taken (e.g. `IMG_20230714_182205.heic`) and
+  gives the file that date.
+- **It never keeps the same photo twice.** It recognises a photo by its content, whether it
+  came from the shortcut or the browser page, so running the shortcut again is safe.
+  It does upload everything again, though, so for a large library send one period at a
+  time with the *Creation Date* (NL: *Aanmaakdatum*) filter in Find Photos.
+- Use a fixed access code (`--code`) so the pasted link keeps working.
+- Photos arrive in their original format, usually HEIC. Windows can open these with
+  Microsoft's free "HEIF Image Extensions".
 
 ## Notes
 
