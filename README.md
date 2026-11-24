@@ -46,9 +46,10 @@ Built for large transfers (thousands of pictures):
 
 ## Sending thousands of pictures (e.g. a whole iPhone library)
 
-- **Selecting on iPhone:** the iPhone photo picker has no "Select All" button. Tap the first
-  photo, then without lifting your finger slide across and down the grid. That selects
-  whole rows at a time and the picker scrolls by itself.
+- **Selecting on iPhone:** the photo picker in the browser has no "Select All" button. Put
+  your finger on the first photo, slide *sideways* along the row first, then down without
+  lifting your finger. That selects whole rows and the picker scrolls by itself.
+- **Or skip selecting entirely with an iPhone Shortcut** (see below).
 - **Send in parts of about 500 to 1,000.** For each picture you select, the iPhone first
   copies it, converting it to JPEG if needed, before the upload starts. Selecting thousands
   at once can take a long time and uses a lot of free space on the phone. Because pictures
@@ -59,6 +60,28 @@ Built for large transfers (thousands of pictures):
 - To know which pictures it already received, the PC keeps a list in
   `.localtransfer-received.txt` in the output folder. Delete that file if you want to
   send the same pictures again.
+
+## iPhone Shortcut: send all photos without selecting
+
+The Shortcuts app can find photos by itself, for example all photos or only those from the
+last month, and send each one the PC doesn't have yet. On the phone page, open
+**"iPhone: send ALL photos without selecting (Shortcut)"**. It lists the steps with your
+PC's address and access code filled in, plus Copy buttons. In short:
+
+1. **Find Photos** (Media Type is Image; optionally a Creation Date filter)
+2. **Repeat with Each**, and inside it:
+   1. **Get Details of Images** → Name, then again → Date Taken
+   2. **Format Date** with the custom format `yyyyMMdd-HHmmss`
+   3. **Get Contents of URL** `http://<PC>:8765/has?t=<code>` with the headers
+      `X-Name` = Name and `X-Taken` = Formatted Date. The PC answers `yes` or `no`.
+   4. **If** the result is `no`: **Get Contents of URL** `http://<PC>:8765/upload?t=<code>`,
+      method POST, the same headers, Request Body **File** = Repeat Item.
+
+Because the PC remembers what it has, you can run the shortcut again whenever you want
+and it only sends new photos. Use a fixed access code (`--code`) so the URLs stay valid.
+Photos arrive in their original format (usually HEIC). Add a **Convert Image** (JPEG) step
+if you want JPEG. Photos sent by the shortcut and photos sent from the browser page are
+tracked separately, so use one method for a given set of photos to avoid duplicates.
 
 ## Notes
 

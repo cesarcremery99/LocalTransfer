@@ -113,8 +113,48 @@ class Manifest:
                 fh.write(f"{key}\t{saved_as}\n")
 
 
+KNOWN_EXTS = {".jpg", ".jpeg", ".heic", ".heif", ".png", ".gif", ".webp", ".dng", ".tif", ".tiff",
+              ".mov", ".mp4", ".m4v", ".avif"}
+
+
+def sniff_extension(path: Path) -> str:
+    """Guess a file extension from the first bytes (for uploads sent without one)."""
+    with open(path, "rb") as fh:
+        head = fh.read(16)
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head.startswith(b"\x89PNG"):
+        return ".png"
+    if head.startswith(b"GIF8"):
+        return ".gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1"):
+            return ".heic"
+        if brand == b"avif":
+            return ".avif"
+        if brand == b"qt  ":
+            return ".mov"
+        return ".mp4"
+    return ""
+
+
+def parse_taken(raw: str) -> float | None:
+    """Parse the Shortcut's date header (yyyyMMdd-HHmmss, local time)."""
+    try:
+        return _dt.datetime.strptime(raw.strip(), "%Y%m%d-%H%M%S").timestamp()
+    except ValueError:
+        return None
+
+
 def clean_key(raw: str) -> str:
     return re.sub(r"[\t\r\n]", " ", raw)[:300]
+
+
+class _AlreadyAnswered(Exception):
+    """An error response was already sent for this request."""
 
 
 class TransferHandler(BaseHTTPRequestHandler):
@@ -159,6 +199,51 @@ class TransferHandler(BaseHTTPRequestHandler):
             return None
         return length
 
+    def _shortcut_key(self, query: dict) -> str | None:
+        """Key for uploads from the iPhone Shortcut: photo name + date taken,
+        sent as X-Name / X-Taken headers (or name / taken query parameters)."""
+        name = self.headers.get("X-Name") or (query.get("name") or [""])[0]
+        taken = self.headers.get("X-Taken") or (query.get("taken") or [""])[0]
+        if not name:
+            return None
+        return clean_key(f"shortcut|{name.strip()}|{taken.strip()}")
+
+    def _read_body(self, fh) -> int:
+        """Copy the request body into fh; supports Content-Length and chunked uploads."""
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            total = 0
+            while True:
+                size_line = self.rfile.readline(1024)
+                if not size_line:
+                    raise ConnectionError("phone disconnected mid-upload")
+                size = int(size_line.split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                        pass  # skip trailers
+                    return total
+                total += size
+                if total > MAX_UPLOAD_BYTES:
+                    raise ValueError("upload too large")
+                remaining = size
+                while remaining > 0:
+                    chunk = self.rfile.read(min(CHUNK, remaining))
+                    if not chunk:
+                        raise ConnectionError("phone disconnected mid-upload")
+                    fh.write(chunk)
+                    remaining -= len(chunk)
+                self.rfile.readline(1024)  # CRLF after each chunk
+        length = self._length(MAX_UPLOAD_BYTES)
+        if length is None:
+            raise _AlreadyAnswered()
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(CHUNK, remaining))
+            if not chunk:
+                raise ConnectionError("phone disconnected mid-upload")
+            fh.write(chunk)
+            remaining -= len(chunk)
+        return length
+
     def log_request(self, code="-", size="-") -> None:
         pass  # don't print a line for each of thousands of requests
 
@@ -173,6 +258,15 @@ class TransferHandler(BaseHTTPRequestHandler):
         elif url.path == "/ping":
             ok = self._authorized(parse_qs(url.query))
             self._json(HTTPStatus.OK if ok else HTTPStatus.FORBIDDEN, {"ok": ok})
+        elif url.path == "/has":
+            # Used by the iPhone Shortcut: plain-text "yes" / "no" is easy to test there.
+            query = parse_qs(url.query)
+            if not self._authorized(query):
+                self._send(HTTPStatus.FORBIDDEN, b"wrong access code", "text/plain")
+                return
+            key = self._shortcut_key(query)
+            answer = b"yes" if key and key in self.manifest else b"no"
+            self._send(HTTPStatus.OK, answer, "text/plain; charset=utf-8")
         else:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -202,36 +296,41 @@ class TransferHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"have": have})
 
     def _upload(self, query: dict) -> None:
-        length = self._length(MAX_UPLOAD_BYTES)
-        if length is None:
-            return
-        raw_name = (query.get("name") or ["upload"])[0]
+        raw_name = self.headers.get("X-Name") or (query.get("name") or ["upload"])[0]
         name = safe_filename(raw_name, "upload")
-        key = clean_key((query.get("key") or [f"{raw_name}|{length}"])[0])
         target_dir = self.output_dir / _dt.date.today().isoformat()
         target_dir.mkdir(parents=True, exist_ok=True)
         partial = target_dir / f".{secrets.token_hex(8)}.part"
 
-        remaining = length
         try:
             with open(partial, "wb") as fh:
-                while remaining > 0:
-                    chunk = self.rfile.read(min(CHUNK, remaining))
-                    if not chunk:
-                        raise ConnectionError("phone disconnected mid-upload")
-                    fh.write(chunk)
-                    remaining -= len(chunk)
-            try:  # keep the photo's original date if the phone sent one
+                length = self._read_body(fh)
+            if length == 0:
+                raise ValueError("empty upload")
+            # Keep the photo's original date if the phone sent one.
+            mtime = None
+            try:
                 mtime = float((query.get("lm") or [""])[0]) / 1000
-                if mtime > 0:
-                    os.utime(partial, (mtime, mtime))
             except ValueError:
                 pass
+            if not mtime or mtime <= 0:
+                mtime = parse_taken(self.headers.get("X-Taken") or (query.get("taken") or [""])[0])
+            if mtime and mtime > 0:
+                os.utime(partial, (mtime, mtime))
+            # Shortcuts may send names without an extension ("IMG_1234").
+            stem, ext = os.path.splitext(name)
+            if ext.lower() not in KNOWN_EXTS:
+                name += sniff_extension(partial)
+            elif ext.lower() in (".heic", ".heif") and sniff_extension(partial) == ".jpg":
+                name = stem + ".jpg"  # converted to JPEG on the phone
             with self.name_lock:  # pick a free name and claim it atomically
                 final = unique_path(target_dir, name)
                 partial.rename(final)
                 TransferHandler.saved_count += 1
                 count = TransferHandler.saved_count
+        except _AlreadyAnswered:
+            partial.unlink(missing_ok=True)
+            return
         except Exception as exc:  # noqa: BLE001
             partial.unlink(missing_ok=True)
             self.close_connection = True
@@ -242,6 +341,7 @@ class TransferHandler(BaseHTTPRequestHandler):
                 pass
             return
 
+        key = self._shortcut_key(query) or clean_key((query.get("key") or [f"{raw_name}|{length}"])[0])
         self.manifest.add(key, f"{target_dir.name}/{final.name}")
         print(f"  #{count:<6} {final.name}  ({length / 1024 / 1024:.1f} MB)")
         self._json(HTTPStatus.OK, {"ok": True, "saved": final.name, "bytes": length})

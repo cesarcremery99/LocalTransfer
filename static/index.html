@@ -30,6 +30,13 @@
   .hidden { display:none; }
   button.secondary { margin-top:8px; background:transparent; color:var(--text); border:1px solid var(--line); }
   .tip { font-size:.85rem; color:var(--muted); margin:10px 0 0; }
+  details summary { font-weight:600; cursor:pointer; }
+  details ol { padding-left:20px; margin:12px 0 0; }
+  details li { margin-bottom:10px; line-height:1.4; }
+  .copy { display:flex; gap:6px; margin-top:4px; }
+  .copy code { flex:1; min-width:0; overflow-wrap:anywhere; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:.8rem; }
+  .copy button { width:auto; padding:6px 10px; font-size:.8rem; }
+  .k { font-family:ui-monospace,Menlo,monospace; font-size:.85rem; background:var(--bg); padding:1px 4px; border-radius:4px; }
 </style>
 </head>
 <body>
@@ -59,6 +66,37 @@
       <div class="status" id="detail"></div>
       <p class="tip" id="tip">Keep this page open until it finishes. If it stops, choose the same pictures and tap Send again. Pictures already sent are skipped.</p>
     </div>
+    <details class="card" id="shortcut">
+      <summary>iPhone: send ALL photos without selecting (Shortcut)</summary>
+      <p class="tip">Build this once in the iPhone's <b>Shortcuts</b> app. It finds your photos itself and sends
+        any the PC doesn't have yet. You can run it again any time and it only sends new photos.</p>
+      <ol>
+        <li>Open <b>Shortcuts</b>, tap <b>+</b>, and name it “Send photos to PC”.</li>
+        <li>Add <b>Find Photos</b>. Tap <i>Add Filter</i> → <i>Media Type</i> <i>is</i> <i>Image</i>.
+          Optionally add <i>Creation Date</i> <i>is in the last</i> … to send one period at a time.</li>
+        <li>Add <b>Repeat with Each</b> (it uses <i>Photos</i> automatically). Put the next steps <u>inside</u> the repeat.</li>
+        <li>Add <b>Get Details of Images</b>, choose <i>Name</i>, set the image to <i>Repeat Item</i>.</li>
+        <li>Add <b>Get Details of Images</b> again, choose <i>Date Taken</i>, image <i>Repeat Item</i>.</li>
+        <li>Add <b>Format Date</b> with the <i>Date Taken</i> from step 5. Set Date Format to <i>Custom</i> and the format string to
+          <div class="copy"><code>yyyyMMdd-HHmmss</code><button data-copy="yyyyMMdd-HHmmss">Copy</button></div></li>
+        <li>Add <b>Get Contents of URL</b> with this URL:
+          <div class="copy"><code class="u-has"></code><button class="c-has">Copy</button></div>
+          Tap <i>Show More</i> → <i>Headers</i>, add two headers:
+          <span class="k">X-Name</span> = the <i>Name</i> variable (step 4) and
+          <span class="k">X-Taken</span> = the <i>Formatted Date</i> variable (step 6).</li>
+        <li>Add <b>If</b>: <i>Contents of URL</i> <i>is</i> <span class="k">no</span>.</li>
+        <li>Inside the If, add another <b>Get Contents of URL</b> with this URL:
+          <div class="copy"><code class="u-up"></code><button class="c-up">Copy</button></div>
+          <i>Show More</i>: Method <b>POST</b>, the same two headers as step 7, Request Body <b>File</b> → <i>Repeat Item</i>.</li>
+        <li>Optional, after <i>End Repeat</i>: add <b>Show Notification</b> “Done!”.</li>
+      </ol>
+      <p class="tip"><b>Tips:</b> Keep the PC program running with the same access code you used here (start it with
+        <span class="k">--code</span> or type the same code at the prompt), or these links stop working.
+        Keep the iPhone unlocked with Shortcuts open while it runs. If it stops, just run it again: photos already on the PC are
+        skipped. If iOS keeps asking for permission, allow it; in <i>Settings → Apps → Shortcuts → Advanced</i> you can turn on
+        <i>Allow Sharing Large Amounts of Data</i>. Photos arrive in their original format (usually HEIC). To get JPEG instead, add
+        <b>Convert Image</b> (JPEG, Preserve Metadata on) before the upload step and send the <i>Converted Image</i>.</p>
+    </details>
   </div>
 </main>
 
@@ -231,6 +269,19 @@
 
   sendBtn.addEventListener("click", () => { if (!running && selected.length) send(); });
   stopBtn.addEventListener("click", () => { stopping = true; stopBtn.disabled = true; stopBtn.textContent = "Stopping after current pictures…"; });
+
+  // ---------- Shortcut instructions: fill in this PC's address and code ----------
+  const base = location.origin, t = encodeURIComponent(token);
+  const links = { has: `${base}/has?t=${t}`, up: `${base}/upload?t=${t}` };
+  for (const [k, v] of Object.entries(links)) {
+    document.querySelector(".u-" + k).textContent = v;
+    document.querySelector(".c-" + k).dataset.copy = v;
+  }
+  document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; }
+    catch (_) { b.textContent = "Select it"; }
+    setTimeout(() => (b.textContent = "Copy"), 1500);
+  }));
 
   // Verify the access code up front so a bad link fails early.
   fetch(`/ping?t=${encodeURIComponent(token)}`).then((r) => {
